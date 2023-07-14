@@ -734,6 +734,86 @@ impl RowConverter {
         Ok(rows)
     }
 
+    pub fn convert_fixed_width_columns(
+        &mut self,
+        columns: &[ArrayRef],
+    ) -> Result<FixedWidthRows, ArrowError> {
+        if columns.len() != self.fields.len() {
+            return Err(ArrowError::InvalidArgumentError(format!(
+                "Incorrect number of arrays provided to RowConverter, expected {} got {}",
+                self.fields.len(),
+                columns.len()
+            )));
+        }
+
+        let row_width = self
+            .fields
+            .iter()
+            .map(|field| {
+                let width = if let Some(width) = field.data_type.primitive_width() {
+                    width
+                } else {
+                    match field.data_type {
+                        DataType::Null => 0,
+                        DataType::Boolean => 1,
+                        DataType::FixedSizeBinary(n) => n as usize,
+                        _ => {
+                            return Err(ArrowError::InvalidArgumentError(format!(
+                                "The data type {} is not of fixed width",
+                                field.data_type,
+                            )))
+                        }
+                    }
+                };
+                Ok(width + 1)
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .sum();
+
+        let encoders = columns
+            .iter()
+            .zip(&mut self.codecs)
+            .zip(self.fields.iter())
+            .map(|((column, codec), field)| {
+                if !column.data_type().equals_datatype(&field.data_type) {
+                    return Err(ArrowError::InvalidArgumentError(format!(
+                        "RowConverter column schema mismatch, expected {} got {}",
+                        field.data_type,
+                        column.data_type()
+                    )));
+                }
+                codec.encoder(column.as_ref())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let config = RowConfig {
+            fields: Arc::clone(&self.fields),
+            // Don't need to validate UTF-8 as came from arrow array
+            validate_utf8: false,
+        };
+        let mut rows = new_empty_rows(columns, &encoders, config.clone());
+
+        for ((column, field), encoder) in
+            columns.iter().zip(self.fields.iter()).zip(encoders)
+        {
+            // We encode a column at a time to minimise dispatch overheads
+            encode_column(
+                &mut rows.buffer,
+                &mut rows.offsets,
+                column.as_ref(),
+                field.options,
+                &encoder,
+            )
+        }
+
+        Ok(FixedWidthRows {
+            buffer: rows.buffer,
+            width: row_width,
+            config,
+        })
+    }
+
     /// Convert [`Rows`] columns into [`ArrayRef`]
     ///
     /// # Panics
@@ -797,6 +877,34 @@ impl RowConverter {
         Rows {
             offsets,
             buffer: Vec::with_capacity(data_capacity),
+            config: RowConfig {
+                fields: self.fields.clone(),
+                validate_utf8: false,
+            },
+        }
+    }
+
+    pub fn empty_fixed_width_rows(&self, data_capacity: usize) -> FixedWidthRows {
+        let width = self
+            .fields
+            .iter()
+            .map(|field| {
+                let width = if let Some(width) = field.data_type.primitive_width() {
+                    width
+                } else {
+                    match field.data_type {
+                        DataType::Null => 0,
+                        DataType::Boolean => 1,
+                        DataType::FixedSizeBinary(n) => n as usize,
+                        _ => 0,
+                    }
+                };
+                width + 1
+            })
+            .sum();
+        FixedWidthRows {
+            buffer: Vec::with_capacity(data_capacity),
+            width,
             config: RowConfig {
                 fields: self.fields.clone(),
                 validate_utf8: false,
@@ -973,6 +1081,111 @@ impl<'a> ExactSizeIterator for RowsIter<'a> {
 }
 
 impl<'a> DoubleEndedIterator for RowsIter<'a> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.end == self.start {
+            return None;
+        }
+        let row = self.rows.row(self.end);
+        self.end -= 1;
+        Some(row)
+    }
+}
+
+#[derive(Debug)]
+pub struct FixedWidthRows {
+    /// Underlying row bytes
+    buffer: Vec<u8>,
+    /// Row fixed width,
+    width: usize,
+    /// The config for these rows
+    config: RowConfig,
+}
+
+impl FixedWidthRows {
+    /// Append a [`Row`] to this [`Rows`]
+    pub fn push(&mut self, row: Row<'_>) {
+        assert!(
+            Arc::ptr_eq(&row.config.fields, &self.config.fields),
+            "row was not produced by this RowConverter"
+        );
+        assert_eq!(row.data.len(), self.width);
+        self.config.validate_utf8 |= row.config.validate_utf8;
+        self.buffer.extend_from_slice(row.data);
+    }
+
+    pub fn row(&self, row: usize) -> Row<'_> {
+        let start = self.width * row;
+        let end = start + self.width;
+
+        Row {
+            data: &self.buffer[start..end],
+            config: &self.config,
+        }
+    }
+
+    pub fn num_rows(&self) -> usize {
+        self.buffer.len() / self.width
+    }
+
+    pub fn iter(&self) -> FixedWidthRowsIter<'_> {
+        self.into_iter()
+    }
+
+    /// Returns the size of this instance in bytes
+    ///
+    /// Includes the size of `Self`.
+    pub fn size(&self) -> usize {
+        // Size of fields is accounted for as part of RowConverter
+        std::mem::size_of::<Self>() + self.buffer.len()
+    }
+}
+
+impl<'a> IntoIterator for &'a FixedWidthRows {
+    type Item = Row<'a>;
+    type IntoIter = FixedWidthRowsIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        FixedWidthRowsIter {
+            rows: self,
+            start: 0,
+            end: self.num_rows(),
+        }
+    }
+}
+
+/// An iterator over [`FixedWidthRows`]
+#[derive(Debug)]
+pub struct FixedWidthRowsIter<'a> {
+    rows: &'a FixedWidthRows,
+    start: usize,
+    end: usize,
+}
+
+impl<'a> Iterator for FixedWidthRowsIter<'a> {
+    type Item = Row<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.end == self.start {
+            return None;
+        }
+        let row = self.rows.row(self.start);
+        self.start += 1;
+        Some(row)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.len();
+        (len, Some(len))
+    }
+}
+
+impl<'a> ExactSizeIterator for FixedWidthRowsIter<'a> {
+    fn len(&self) -> usize {
+        self.end - self.start
+    }
+}
+
+impl<'a> DoubleEndedIterator for FixedWidthRowsIter<'a> {
     fn next_back(&mut self) -> Option<Self::Item> {
         if self.end == self.start {
             return None;
